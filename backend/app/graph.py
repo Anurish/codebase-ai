@@ -9,6 +9,7 @@ from .llm import answer_question
 
 class CodeState(TypedDict):
     question: str
+    repository: str
     answer: str
     sources: list[dict]
 
@@ -18,6 +19,7 @@ def retrieve(state):
 
     sources = search_chunks(
         embedding,
+        repository=state["repository"],
         limit=6,
     )
 

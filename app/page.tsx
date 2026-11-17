@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   Activity,
@@ -13,6 +13,7 @@ import {
   FileCode2,
   FolderGit2,
   GitBranch,
+  Github,
   Info,
   Loader2,
   RefreshCw,
@@ -58,6 +59,30 @@ type ChatResponse = {
 type IndexResponse = {
   files: number;
   chunks: number;
+  repository: string;
+  name: string;
+  github_url?: string | null;
+  branch?: string | null;
+};
+
+
+type RepositoryInfo = IndexResponse;
+
+type HealthComponent = {
+  status: "healthy" | "error";
+  message: string;
+};
+
+
+type HealthResponse = {
+  status: "healthy" | "degraded";
+  repository: HealthComponent;
+  database: HealthComponent;
+  pgvector: HealthComponent;
+  gemini: HealthComponent;
+  indexed_files: number;
+  indexed_chunks: number;
+  repository_root: string;
 };
 
 
@@ -96,9 +121,26 @@ type ReviewResponse = {
 
 type PageMode = "qa" | "review" | "health";
 
+function healthStatusLabel(status: string) {
+  return status === "healthy"
+    ? "Healthy"
+    : status === "degraded"
+    ? "Degraded"
+    : "Error";
+}
+
 
 export default function Home() {
   const [mode, setMode] = useState<PageMode>("qa");
+
+  const [repositories, setRepositories] = useState<RepositoryInfo[]>([]);
+
+  const [selectedRepository, setSelectedRepository] =
+    useState("codebase-ai");
+
+  const [githubUrl, setGithubUrl] = useState("");
+
+  const [githubBranch, setGithubBranch] = useState("main");
 
   const [query, setQuery] = useState("");
 
@@ -115,6 +157,15 @@ export default function Home() {
   const [indexedFiles, setIndexedFiles] = useState(0);
 
   const [indexedChunks, setIndexedChunks] = useState(0);
+
+  const [healthReport, setHealthReport] =
+    useState<HealthResponse | null>(null);
+
+  const [isHealthLoading, setIsHealthLoading] = useState(false);
+
+  const [healthError, setHealthError] = useState("");
+
+  const [healthRefresh, setHealthRefresh] = useState(0);
 
   const [error, setError] = useState("");
 
@@ -133,56 +184,202 @@ export default function Home() {
   const [selectedFinding, setSelectedFinding] =
     useState<ReviewFinding | null>(null);
 
+  useEffect(() => {
+    let cancelled = false;
 
-  async function indexRepository() {
+    async function loadRepositories() {
+      try {
+        const response = await fetch(
+          "http://localhost:8000/api/repositories"
+        );
+        if (!response.ok) {
+          throw new Error(`Backend returned HTTP ${response.status}`);
+        }
+
+        const data: RepositoryInfo[] = await response.json();
+        if (cancelled) return;
+
+        setRepositories(data);
+        const activeRepository =
+          data.find((repository) => repository.repository === "codebase-ai") ||
+          data[0];
+        setSelectedRepository(activeRepository?.repository || "codebase-ai");
+        setIndexedFiles(activeRepository?.files || 0);
+        setIndexedChunks(activeRepository?.chunks || 0);
+      } catch (err) {
+        console.error("Repository list error:", err);
+      }
+    }
+
+    void loadRepositories();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (mode !== "health") return;
+
+    let cancelled = false;
+
+    async function loadHealth() {
+      setIsHealthLoading(true);
+      setHealthError("");
+
+      try {
+        const response = await fetch(
+          `http://localhost:8000/api/health/details?repository=${encodeURIComponent(
+            selectedRepository
+          )}`
+        );
+        const body = await response.json().catch(() => null);
+
+        if (!response.ok) {
+          throw new Error(
+            body?.detail || `Backend returned HTTP ${response.status}`
+          );
+        }
+
+        if (!cancelled) {
+          const report: HealthResponse = body;
+          setHealthReport(report);
+          setIndexedFiles(report.indexed_files);
+          setIndexedChunks(report.indexed_chunks);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          console.error("Repository health check failed:", err);
+          setHealthError(
+            err instanceof Error
+              ? err.message
+              : "Unable to load repository health."
+          );
+          setHealthReport(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsHealthLoading(false);
+        }
+      }
+    }
+
+    void loadHealth();
+    return () => {
+      cancelled = true;
+    };
+  }, [healthRefresh, mode, selectedRepository]);
+
+
+  async function runIndexRequest(url: string, init?: RequestInit) {
     if (isIndexing) return;
 
     setError("");
-
     setIsIndexing(true);
-
     setIndexStatus("Indexing repository...");
 
     try {
-      const response = await fetch(
-        "http://localhost:8000/api/index",
-        {
-          method: "POST",
-        }
-      );
+      const response = await fetch(url, init);
 
       if (!response.ok) {
+        const body = await response.json().catch(() => null);
         throw new Error(
-          `Backend returned HTTP ${response.status}`
+          body?.detail || `Backend returned HTTP ${response.status}`
         );
       }
 
-      const data: IndexResponse =
-        await response.json();
-
+      const data: IndexResponse = await response.json();
+      setRepositories((current) => [
+        data,
+        ...current.filter(
+          (repository) => repository.repository !== data.repository
+        ),
+      ]);
+      setSelectedRepository(data.repository);
       setIndexedFiles(data.files);
-
       setIndexedChunks(data.chunks);
-
+      setHealthReport(null);
       setIndexStatus(
-        `${data.files} files · ${data.chunks} chunks indexed`
+        `${data.name}: ${data.files} files · ${data.chunks} chunks indexed`
       );
     } catch (err) {
-      console.error(
-        "Repository indexing error:",
-        err
-      );
-
+      console.error("Repository indexing error:", err);
       setIndexStatus("");
-
       setError(
-        "Unable to index the repository. Make sure the Codebase AI backend is running."
+        err instanceof Error
+          ? err.message
+          : "Unable to index the repository."
       );
     } finally {
       setIsIndexing(false);
     }
   }
 
+  async function indexRepository() {
+    const repository = repositories.find(
+      (item) => item.repository === selectedRepository
+    );
+
+    if (repository?.github_url && repository.branch) {
+      await runIndexRequest(
+        "http://localhost:8000/api/index/github",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            github_url: repository.github_url,
+            branch: repository.branch,
+          }),
+        }
+      );
+      return;
+    }
+
+    await runIndexRequest(
+      `http://localhost:8000/api/index?repository=${encodeURIComponent(
+        selectedRepository
+      )}`,
+      { method: "POST" }
+    );
+  }
+
+  async function addGithubRepository() {
+    const url = githubUrl.trim();
+    const branch = githubBranch.trim();
+    if (!url || !branch) {
+      setError("Enter a GitHub repository URL and branch.");
+      return;
+    }
+
+    await runIndexRequest(
+      "http://localhost:8000/api/index/github",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ github_url: url, branch }),
+      }
+    );
+  }
+
+  function changeRepository(repository: string) {
+    setSelectedRepository(repository);
+    setMessages([]);
+    setReviewAnswer("");
+    setReviewSources([]);
+    setReviewFindings([]);
+    setReviewSummary(null);
+    setReviewedChunks(0);
+    setSelectedFile("");
+    setIndexStatus("");
+    setError("");
+    setHealthReport(null);
+    setHealthError("");
+
+    const selected = repositories.find(
+      (item) => item.repository === repository
+    );
+    setIndexedFiles(selected?.files || 0);
+    setIndexedChunks(selected?.chunks || 0);
+  }
 
   async function ask(text?: string) {
     const value = (text ?? query).trim();
@@ -215,7 +412,7 @@ export default function Home() {
           },
           body: JSON.stringify({
             question: value,
-            repository: "codebase-ai",
+            repository: selectedRepository,
           }),
         }
       );
@@ -286,7 +483,9 @@ export default function Home() {
 
     try {
       const response = await fetch(
-        "http://localhost:8000/api/review",
+        `http://localhost:8000/api/review?repository=${encodeURIComponent(
+          selectedRepository
+        )}`,
         {
           method: "POST",
         }
@@ -395,6 +594,10 @@ export default function Home() {
         selectedFile
     ) || currentSources[0];
 
+  const activeRepositoryInfo = repositories.find(
+    (item) => item.repository === selectedRepository
+  );
+
 
   return (
     <main className="shell">
@@ -428,13 +631,32 @@ export default function Home() {
 
           <div className="repoName">
             <FolderGit2 size={17} />
-            codebase-ai
+            {activeRepositoryInfo?.name || "codebase-ai"}
           </div>
 
           <div className="repoMeta">
             <GitBranch size={13} />
-            main
+            {activeRepositoryInfo?.branch || "local"}
           </div>
+
+          <label className="repoSelectLabel" htmlFor="repository-select">
+            Active repository
+          </label>
+          <select
+            id="repository-select"
+            className="repoSelect"
+            value={selectedRepository}
+            onChange={(event) => changeRepository(event.target.value)}
+          >
+            {repositories.map((repository) => (
+              <option
+                key={repository.repository}
+                value={repository.repository}
+              >
+                {repository.name}
+              </option>
+            ))}
+          </select>
 
         </div>
 
@@ -515,7 +737,7 @@ export default function Home() {
             <div className="breadcrumb">
               WORKSPACE
               <ChevronRight size={14} />
-              codebase-ai
+              {activeRepositoryInfo?.name || "codebase-ai"}
             </div>
 
             <h1>
@@ -585,7 +807,7 @@ export default function Home() {
 
                     <span>
                       {indexStatus ||
-                        "Index your repository before asking code questions."}
+                        "Index a local folder or public GitHub repository."}
                     </span>
 
                   </div>
@@ -610,12 +832,55 @@ export default function Home() {
                   ) : (
                     <>
                       <RefreshCw size={16} />
-                      Index Repository
+                      Index Selected
                     </>
                   )}
 
                 </button>
 
+              </section>
+
+              <section className="githubImportPanel">
+                <div className="githubImportHeading">
+                  <Github size={17} />
+                  <div>
+                    <strong>Index a public GitHub repository</strong>
+                    <span>Choose a repository URL and branch to add it to your workspace.</span>
+                  </div>
+                </div>
+                <div className="githubImportFields">
+                  <input
+                    aria-label="GitHub repository URL"
+                    type="url"
+                    placeholder="https://github.com/owner/repository"
+                    value={githubUrl}
+                    onChange={(event) => setGithubUrl(event.target.value)}
+                  />
+                  <input
+                    aria-label="GitHub branch"
+                    type="text"
+                    placeholder="main"
+                    value={githubBranch}
+                    onChange={(event) => setGithubBranch(event.target.value)}
+                  />
+                  <button
+                    className="indexButton"
+                    onClick={addGithubRepository}
+                    disabled={isIndexing}
+                  >
+                    {isIndexing ? (
+                      <>
+                        <Loader2 size={16} className="spinner" />
+                        Indexing...
+                      </>
+                    ) : (
+                      <>
+                        <Github size={16} />
+                        Add &amp; Index
+                      </>
+                    )}
+                  </button>
+                </div>
               </section>
 
 
@@ -1081,13 +1346,33 @@ export default function Home() {
                   </h2>
 
                   <p>
-                    Overview of the repository
-                    currently indexed by Codebase AI.
+                    Live status for{" "}
+                    {activeRepositoryInfo?.name || "the selected repository"}.
                   </p>
 
                 </div>
 
+                <button
+                  type="button"
+                  className="healthRefreshButton"
+                  onClick={() => setHealthRefresh((value) => value + 1)}
+                  disabled={isHealthLoading}
+                >
+                  {isHealthLoading ? (
+                    <Loader2 size={15} className="spinner" />
+                  ) : (
+                    <RefreshCw size={15} />
+                  )}
+                  Refresh
+                </button>
+
               </section>
+
+              {healthError && (
+                <div className="errorMessage" role="alert">
+                  {healthError}
+                </div>
+              )}
 
 
               <div className="healthGrid">
@@ -1097,7 +1382,9 @@ export default function Home() {
                   <Database size={20} />
 
                   <strong>
-                    {indexedFiles || 21}
+                    {isHealthLoading && !healthReport
+                      ? "..."
+                      : healthReport?.indexed_files ?? 0}
                   </strong>
 
                   <span>
@@ -1112,7 +1399,9 @@ export default function Home() {
                   <Code2 size={20} />
 
                   <strong>
-                    {indexedChunks || 36}
+                    {isHealthLoading && !healthReport
+                      ? "..."
+                      : healthReport?.indexed_chunks ?? 0}
                   </strong>
 
                   <span>
@@ -1127,11 +1416,15 @@ export default function Home() {
                   <CheckCircle2 size={20} />
 
                   <strong>
-                    Ready
+                    {healthReport
+                      ? healthStatusLabel(healthReport.pgvector.status)
+                      : isHealthLoading
+                      ? "Checking"
+                      : "Unknown"}
                   </strong>
 
                   <span>
-                    Vector index
+                    pgvector
                   </span>
 
                 </div>
@@ -1142,11 +1435,15 @@ export default function Home() {
                   <Sparkles size={20} />
 
                   <strong>
-                    Gemini
+                    {healthReport
+                      ? healthStatusLabel(healthReport.gemini.status)
+                      : isHealthLoading
+                      ? "Checking"
+                      : "Unknown"}
                   </strong>
 
                   <span>
-                    AI engine
+                    Gemini configuration
                   </span>
 
                 </div>
@@ -1162,70 +1459,39 @@ export default function Home() {
                     <Activity size={18} />
                     <strong>
                       System status
+                      {healthReport && ` · ${healthStatusLabel(healthReport.status)}`}
                     </strong>
                   </div>
 
                 </div>
 
 
-                <div className="healthRow">
-
-                  <span>
-                    Repository
-                  </span>
-
-                  <strong>
-                    codebase-ai
-                  </strong>
-
-                  <CheckCircle2 size={16} />
-
-                </div>
-
-
-                <div className="healthRow">
-
-                  <span>
-                    PostgreSQL
-                  </span>
-
-                  <strong>
-                    Connected
-                  </strong>
-
-                  <CheckCircle2 size={16} />
-
-                </div>
-
-
-                <div className="healthRow">
-
-                  <span>
-                    pgvector
-                  </span>
-
-                  <strong>
-                    Active
-                  </strong>
-
-                  <CheckCircle2 size={16} />
-
-                </div>
-
-
-                <div className="healthRow">
-
-                  <span>
-                    Gemini
-                  </span>
-
-                  <strong>
-                    Connected
-                  </strong>
-
-                  <CheckCircle2 size={16} />
-
-                </div>
+                {healthReport ? (
+                  <>
+                    <HealthRow
+                      label={`Repository · ${activeRepositoryInfo?.name || "Selected"}`}
+                      component={healthReport.repository}
+                    />
+                    <HealthRow
+                      label="PostgreSQL"
+                      component={healthReport.database}
+                    />
+                    <HealthRow
+                      label="pgvector"
+                      component={healthReport.pgvector}
+                    />
+                    <HealthRow
+                      label="Gemini"
+                      component={healthReport.gemini}
+                    />
+                  </>
+                ) : (
+                  <div className="healthMessage" role="status">
+                    {isHealthLoading
+                      ? "Checking repository and service status..."
+                      : "Health data is not available. Refresh to try again."}
+                  </div>
+                )}
 
               </section>
 
@@ -1237,6 +1503,29 @@ export default function Home() {
       </section>
 
     </main>
+  );
+}
+
+
+function HealthRow({
+  label,
+  component,
+}: {
+  label: string;
+  component: HealthComponent;
+}) {
+  const isHealthy = component.status === "healthy";
+
+  return (
+    <div className="healthRow">
+      <span>{label}</span>
+      <strong>{component.message}</strong>
+      {isHealthy ? (
+        <CheckCircle2 className="healthStatusHealthy" size={16} />
+      ) : (
+        <XCircle className="healthStatusError" size={16} />
+      )}
+    </div>
   );
 }
 

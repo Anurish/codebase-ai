@@ -781,6 +781,45 @@
   color: #69c990;
 }
 
+.healthRow .healthStatusError {
+  color: #ff7777;
+}
+
+.healthRow .healthStatusHealthy {
+  color: #69c990;
+}
+
+.healthRow strong {
+  text-align: right;
+  line-height: 1.5;
+}
+
+.healthMessage {
+  padding: 18px;
+  color: #929caf;
+  font-size: 12px;
+}
+
+.healthRefreshButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.055);
+  color: #d9deea;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.healthRefreshButton:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
 
 /* ============================== */
 /* EXISTING INDEX STYLES */
@@ -984,6 +1023,95 @@
   .healthRow svg {
     grid-column: 2;
     grid-row: 1 / span 2;
+  }
+}
+
+.repoSelectLabel {
+  display: block;
+  margin-top: 13px;
+  color: #70798b;
+  font-size: 10px;
+}
+
+.repoSelect {
+  width: 100%;
+  margin-top: 6px;
+  padding: 8px 9px;
+  border: 1px solid #2a303b;
+  border-radius: 7px;
+  outline: 0;
+  background: #0c0f15;
+  color: #dce2ed;
+  font-size: 11px;
+}
+
+.githubImportPanel {
+  margin: 0 0 20px;
+  padding: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.githubImportHeading {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  color: #aab5ca;
+}
+
+.githubImportHeading > svg {
+  margin-top: 1px;
+  flex: 0 0 auto;
+}
+
+.githubImportHeading div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.githubImportHeading strong {
+  color: #e4e9f2;
+  font-size: 12px;
+}
+
+.githubImportHeading span {
+  color: #7d879a;
+  font-size: 11px;
+}
+
+.githubImportFields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px auto;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.githubImportFields input {
+  min-width: 0;
+  min-height: 38px;
+  padding: 0 11px;
+  border: 1px solid #2a303b;
+  border-radius: 8px;
+  outline: 0;
+  background: #0c0f15;
+  color: #e4e9f2;
+  font-size: 11px;
+}
+
+.githubImportFields input:focus,
+.repoSelect:focus {
+  border-color: #586781;
+}
+
+@media (max-width: 760px) {
+  .githubImportFields {
+    grid-template-columns: 1fr;
+  }
+
+  .githubImportFields input {
+    min-height: 38px;
   }
 }
 

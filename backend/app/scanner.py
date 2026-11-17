@@ -58,10 +58,11 @@ def iter_source_files(root):
     base = Path(root)
 
     for path in base.rglob("*"):
+        relative_path = path.relative_to(base)
         if (
             path.is_file()
             and path.suffix.lower() in EXTENSIONS
-            and not any(part in IGNORED_DIRS for part in path.parts)
+            and not any(part in IGNORED_DIRS for part in relative_path.parts)
         ):
             try:
                 if path.stat().st_size <= 500_000:
@@ -112,7 +113,9 @@ def scan_repository(root):
     chunks = []
 
     for path in iter_source_files(root):
-        files += 1
-        chunks.extend(chunk_file(path, base))
+        file_chunks = chunk_file(path, base)
+        if file_chunks:
+            files += 1
+            chunks.extend(file_chunks)
 
     return files, chunks

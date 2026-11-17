@@ -1,11 +1,17 @@
 from typing import List
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from .config import DEFAULT_REPOSITORY_ID
 
 
 class ChatRequest(BaseModel):
     question: str
-    repository: str = "codebase-ai"
+    repository: str = Field(
+        default=DEFAULT_REPOSITORY_ID,
+        min_length=1,
+        max_length=512,
+    )
 
 
 class Source(BaseModel):
@@ -22,6 +28,24 @@ class ChatResponse(BaseModel):
 
 
 class IndexResponse(BaseModel):
+    files: int
+    chunks: int
+    repository: str = DEFAULT_REPOSITORY_ID
+    name: str = DEFAULT_REPOSITORY_ID
+    github_url: str | None = None
+    branch: str | None = None
+
+
+class GitHubIndexRequest(BaseModel):
+    github_url: str = Field(min_length=1, max_length=2048)
+    branch: str = Field(default="main", min_length=1, max_length=255)
+
+
+class RepositoryInfo(BaseModel):
+    repository: str
+    name: str
+    github_url: str | None = None
+    branch: str | None = None
     files: int
     chunks: int
 

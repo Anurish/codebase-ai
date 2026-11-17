@@ -1,25 +1,31 @@
-from pathlib import Path
+
 import logging
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import settings
+from app.config import DEFAULT_REPOSITORY_ID, settings
 from app.db import (
     init_db,
-    clear_index,
-    insert_chunks,
+    replace_index,
+    get_repositories,
     search_chunks,
     get_all_chunks,
 )
+from app.github import (
+    GitHubDownloadError,
+    download_public_repository,
+    parse_github_repository,
+)
 from app.scanner import scan_repository
 from app.embeddings import embed_texts
-from app.graph import answer_question
 from app.llm import review_repository
 from app.schemas import (
     ChatRequest,
     ChatResponse,
+    GitHubIndexRequest,
     IndexResponse,
+    RepositoryInfo,
     ReviewResponse,
     Source,
     HealthComponent,
@@ -27,43 +33,41 @@ from app.schemas import (
 )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Logging
-# ---------------------------------------------------------
+# =========================================================
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------
-# FastAPI
-# ---------------------------------------------------------
+# =========================================================
+# FastAPI application
+# =========================================================
 
 app = FastAPI(
     title="Codebase AI",
-    version="0.8.0",
+    version="0.8.1",
     description="AI-powered repository analysis and code review agent.",
 )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # CORS
-# ---------------------------------------------------------
+# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-    ],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Startup
-# ---------------------------------------------------------
+# =========================================================
 
 @app.on_event("startup")
 def startup_event():
@@ -71,62 +75,35 @@ def startup_event():
     logger.info("Database initialized")
 
 
-# ---------------------------------------------------------
-# Basic Health
-# ---------------------------------------------------------
+# =========================================================
+# Basic health
+# =========================================================
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "service": "codebase-ai-backend",
-        "version": "0.8.0",
+        "version": "0.8.1",
     }
 
 
-# ---------------------------------------------------------
-# Detailed Repository Health
-# ---------------------------------------------------------
+# =========================================================
+# Detailed repository health
+# =========================================================
 
-@app.get(
-    "/api/health/details",
-    response_model=HealthResponse,
-)
-def detailed_health():
-    """
-    Detailed health information for:
-
-    - Repository
-    - PostgreSQL
-    - pgvector
-    - Gemini configuration
-    - Indexed files
-    - Indexed chunks
-    """
-
-    # -----------------------------
-    # Repository check
-    # -----------------------------
-
-    repository_path = Path(settings.repository_root)
-
-    if repository_path.exists() and repository_path.is_dir():
-        repository_health = HealthComponent(
-            status="healthy",
-            message="Repository directory is available.",
-        )
-    else:
-        repository_health = HealthComponent(
-            status="error",
-            message="Repository directory is not available.",
-        )
-
-    # Defaults
+@app.get("/api/health/details", response_model=HealthResponse)
+def detailed_health(
+    repository: str = Query(DEFAULT_REPOSITORY_ID, min_length=1, max_length=512),
+):
+    repository_health = HealthComponent(
+        status="error",
+        message="Could not verify the selected repository index.",
+    )
     database_health = HealthComponent(
         status="error",
         message="Database check failed.",
     )
-
     pgvector_health = HealthComponent(
         status="error",
         message="pgvector check failed.",
@@ -135,16 +112,10 @@ def detailed_health():
     indexed_files = 0
     indexed_chunks = 0
 
-    # -----------------------------
-    # Database + pgvector
-    # -----------------------------
-
     try:
         from app.db import get_conn
 
         with get_conn() as conn:
-
-            # PostgreSQL
             db_row = conn.execute(
                 "SELECT current_database()"
             ).fetchone()
@@ -156,7 +127,6 @@ def detailed_health():
                 message=f"PostgreSQL connected: {database_name}",
             )
 
-            # pgvector
             vector_row = conn.execute(
                 """
                 SELECT extversion
@@ -176,25 +146,36 @@ def detailed_health():
                     message="pgvector extension is not installed.",
                 )
 
-            # Indexed chunks
             chunk_row = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM code_chunks
-                """
+                "SELECT COUNT(*) FROM code_chunks WHERE repository = %s",
+                (repository,),
             ).fetchone()
 
             indexed_chunks = int(chunk_row[0]) if chunk_row else 0
 
-            # Indexed files
             file_row = conn.execute(
                 """
                 SELECT COUNT(DISTINCT path)
                 FROM code_chunks
-                """
+                WHERE repository = %s
+                """,
+                (repository,),
             ).fetchone()
 
             indexed_files = int(file_row[0]) if file_row else 0
+            if indexed_chunks:
+                repository_health = HealthComponent(
+                    status="healthy",
+                    message=(
+                        f"Indexed {indexed_files} files and "
+                        f"{indexed_chunks} code chunks."
+                    ),
+                )
+            else:
+                repository_health = HealthComponent(
+                    status="error",
+                    message="No indexed code chunks for this repository.",
+                )
 
     except Exception as exc:
         logger.exception("Detailed health database check failed")
@@ -208,25 +189,24 @@ def detailed_health():
             status="error",
             message="Could not verify pgvector.",
         )
-
-    # -----------------------------
-    # Gemini configuration
-    # -----------------------------
+        repository_health = HealthComponent(
+            status="error",
+            message="Could not verify the selected repository index.",
+        )
 
     if settings.gemini_api_key:
         gemini_health = HealthComponent(
             status="healthy",
-            message="Gemini API key is configured.",
+            message=(
+                "Gemini API key is configured. "
+                "Live API connectivity and quota are not tested."
+            ),
         )
     else:
         gemini_health = HealthComponent(
             status="error",
             message="Gemini API key is not configured.",
         )
-
-    # -----------------------------
-    # Overall status
-    # -----------------------------
 
     components = [
         repository_health,
@@ -235,10 +215,11 @@ def detailed_health():
         gemini_health,
     ]
 
-    if any(component.status == "error" for component in components):
-        overall_status = "degraded"
-    else:
-        overall_status = "healthy"
+    overall_status = (
+        "degraded"
+        if any(component.status == "error" for component in components)
+        else "healthy"
+    )
 
     return HealthResponse(
         status=overall_status,
@@ -252,115 +233,185 @@ def detailed_health():
     )
 
 
-# ---------------------------------------------------------
-# Index Repository
-# ---------------------------------------------------------
+# =========================================================
+# Repository indexing
+# =========================================================
 
-@app.post(
-    "/api/index",
-    response_model=IndexResponse,
-)
-def index_repository():
+def index_repository_path(
+    root: str,
+    repository: str,
+    name: str,
+    github_url: str | None = None,
+    branch: str | None = None,
+) -> IndexResponse:
+    file_count, chunks = scan_repository(root)
 
+    if not chunks:
+        raise HTTPException(
+            status_code=400,
+            detail="No supported source chunks found in repository.",
+        )
+
+    logger.info("Generating embeddings for %s chunks", len(chunks))
+    vectors = embed_texts(
+        [chunk["content"] for chunk in chunks],
+        task_type="RETRIEVAL_DOCUMENT",
+    )
+
+    if len(vectors) != len(chunks):
+        raise RuntimeError(
+            f"Embedding count mismatch: received {len(vectors)} "
+            f"vectors for {len(chunks)} chunks."
+        )
+
+    rows = [
+        (
+            chunk["path"],
+            chunk["start_line"],
+            chunk["end_line"],
+            chunk["content"],
+            vector,
+        )
+        for chunk, vector in zip(chunks, vectors)
+    ]
+
+    replace_index(
+        repository,
+        rows,
+        name=name,
+        github_url=github_url,
+        branch=branch,
+    )
+
+    logger.info(
+        "Indexing completed: %s files, %s chunks for %s",
+        file_count,
+        len(chunks),
+        repository,
+    )
+    return IndexResponse(
+        files=file_count,
+        chunks=len(chunks),
+        repository=repository,
+        name=name,
+        github_url=github_url,
+        branch=branch,
+    )
+
+
+@app.get("/api/repositories", response_model=list[RepositoryInfo])
+def list_repositories():
     try:
-        logger.info("Starting repository indexing")
+        return get_repositories()
+    except Exception as exc:
+        logger.exception("Repository list retrieval failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not retrieve repositories: {exc}",
+        ) from exc
 
-        files = scan_repository(settings.repository_root)
 
-        if not files:
-            raise HTTPException(
-                status_code=400,
-                detail="No supported source files found in repository.",
-            )
-
-        clear_index()
-
-        contents = [
-            {
-                "path": item["path"],
-                "content": item["content"],
-                "start_line": item["start_line"],
-                "end_line": item["end_line"],
-            }
-            for item in files
-        ]
-
-        texts = [
-            item["content"]
-            for item in contents
-        ]
-
-        logger.info(
-            "Generating embeddings for %s chunks",
-            len(texts),
+@app.post("/api/index", response_model=IndexResponse)
+def index_repository(
+    repository: str = Query(DEFAULT_REPOSITORY_ID, min_length=1, max_length=512),
+):
+    try:
+        logger.info("Starting local repository indexing for %s", repository)
+        return index_repository_path(
+            settings.repository_root,
+            repository,
+            name=repository,
         )
-
-        vectors = embed_texts(
-            texts,
-            task_type="RETRIEVAL_DOCUMENT",
-        )
-
-        rows = []
-
-        for item, vector in zip(contents, vectors):
-            rows.append(
-                {
-                    "path": item["path"],
-                    "start_line": item["start_line"],
-                    "end_line": item["end_line"],
-                    "content": item["content"],
-                    "embedding": vector,
-                }
-            )
-
-        insert_chunks(rows)
-
-        indexed_files = len(
-            set(item["path"] for item in contents)
-        )
-
-        indexed_chunks = len(rows)
-
-        logger.info(
-            "Repository indexing completed: %s files, %s chunks",
-            indexed_files,
-            indexed_chunks,
-        )
-
-        return IndexResponse(
-            files=indexed_files,
-            chunks=indexed_chunks,
-        )
-
     except HTTPException:
         raise
-
     except Exception as exc:
         logger.exception("Repository indexing failed")
-
         raise HTTPException(
             status_code=500,
             detail=f"Repository indexing failed: {str(exc)}",
         )
 
 
-# ---------------------------------------------------------
-# Chat / Q&A
-# ---------------------------------------------------------
+@app.post("/api/index/github", response_model=IndexResponse)
+def index_github_repository(request: GitHubIndexRequest):
+    try:
+        owner, repository_name, github_url, repository_id = (
+            parse_github_repository(request.github_url, request.branch)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-@app.post(
-    "/api/chat",
-    response_model=ChatResponse,
-)
-def chat(request: ChatRequest):
+    logger.info(
+        "Starting public GitHub repository indexing: %s branch %s",
+        github_url,
+        request.branch,
+    )
 
     try:
-        result = answer_question(
-            question=request.question,
-            repository=request.repository,
+        with download_public_repository(
+            owner,
+            repository_name,
+            request.branch,
+        ) as repository_path:
+            return index_repository_path(
+                str(repository_path),
+                repository_id,
+                name=f"{repository_name} ({request.branch})",
+                github_url=github_url,
+                branch=request.branch,
+            )
+    except HTTPException:
+        raise
+    except GitHubDownloadError as exc:
+        logger.warning("GitHub repository indexing failed: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("GitHub repository indexing failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"GitHub repository indexing failed: {exc}",
+        ) from exc
+
+
+# =========================================================
+# Chat / Q&A using LangGraph
+# =========================================================
+
+@app.post("/api/chat", response_model=ChatResponse)
+def chat(request: ChatRequest):
+    try:
+        from app.graph import code_graph
+
+        result = code_graph.invoke(
+            {
+                "question": request.question,
+                "repository": request.repository,
+            }
         )
 
-        return result
+        sources = result.get("sources", [])
+
+        formatted_sources = [
+            Source(
+                file=source["path"],
+                path=source["path"],
+                lines=(
+                    f'{source["start_line"]}-'
+                    f'{source["end_line"]}'
+                ),
+                score=str(source["score"]),
+                content=source["content"],
+            )
+            for source in sources
+        ]
+
+        return ChatResponse(
+            answer=result["answer"],
+            sources=formatted_sources,
+        )
+
+    except HTTPException:
+        raise
 
     except Exception as exc:
         logger.exception("Chat request failed")
@@ -371,57 +422,18 @@ def chat(request: ChatRequest):
         )
 
 
-# ---------------------------------------------------------
-# Convert DB chunks to review sources
-# ---------------------------------------------------------
+# =========================================================
+# Format review sources
+# =========================================================
 
 def format_review_sources(rows):
-    """
-    Convert database chunks into the Source structure
-    expected by the review pipeline.
-    """
-
-    sources = []
-
-    for row in rows:
-
-        sources.append(
-            {
-                "file": row["path"],
-                "path": row["path"],
-                "lines": (
-                    f'{row["start_line"]}-'
-                    f'{row["end_line"]}'
-                ),
-                "score": "1.0000",
-                "content": row["content"],
-            }
-        )
-
-    return sources
-
-
-# ---------------------------------------------------------
-# Full Repository Review Sources
-# ---------------------------------------------------------
-
-def get_full_repository_review_sources():
-    """
-    Retrieve every indexed repository chunk.
-
-    Keeps both the original database line fields and the
-    formatted source fields so the review pipeline can use
-    either representation.
-    """
-
-    rows = get_all_chunks(limit=1000)
+    """Convert indexed chunks into the review source format."""
 
     sources = []
 
     for row in rows:
         sources.append(
             {
-                "id": row["id"],
                 "file": row["path"],
                 "path": row["path"],
                 "start_line": row["start_line"],
@@ -430,13 +442,26 @@ def get_full_repository_review_sources():
                     f'{row["start_line"]}-'
                     f'{row["end_line"]}'
                 ),
-                "score": "1.0000",
+                "score": str(row.get("score", "1.0000")),
                 "content": row["content"],
             }
         )
 
+    return sources
+
+
+# =========================================================
+# Full repository review sources
+# =========================================================
+
+def get_full_repository_review_sources(repository: str):
+    """Retrieve every currently indexed chunk for review."""
+
+    rows = get_all_chunks(repository=repository, limit=1000)
+    sources = format_review_sources(rows)
+
     file_count = len(
-        set(source["path"] for source in sources)
+        {source["path"] for source in sources}
     )
 
     logger.info(
@@ -448,66 +473,42 @@ def get_full_repository_review_sources():
     return sources
 
 
-# ---------------------------------------------------------
-# Legacy Diverse Review Retrieval
-# ---------------------------------------------------------
+# =========================================================
+# Semantic review retrieval (fallback)
+# =========================================================
 
-def get_diverse_review_sources():
-    """
-    Semantic review retrieval.
-
-    Kept as a fallback/reference implementation.
-
-    The current /api/review endpoint uses the full repository
-    review function above.
-    """
+def get_diverse_review_sources(repository: str):
+    """Retrieve diverse, semantically relevant review chunks."""
 
     review_queries = [
-
-        # Security
         (
             "security vulnerabilities authentication authorization "
-            "credentials secrets API keys tokens passwords "
-            "injection XSS CSRF"
+            "credentials secrets API keys tokens passwords injection XSS CSRF"
         ),
-
-        # Bugs / correctness
         (
             "bugs correctness exceptions error handling failure states "
             "invalid input null values race conditions unsafe operations"
         ),
-
-        # Performance
         (
             "performance database queries SQL vector search API calls "
             "external requests network latency caching expensive operations"
         ),
-
-        # Code quality
         (
             "code quality maintainability architecture code smells "
             "duplicated code coupling separation of concerns configuration"
         ),
-
-        # FastAPI
         (
             "FastAPI backend routes middleware request validation "
             "response handling dependency injection"
         ),
-
-        # Frontend
         (
             "Next.js React frontend state management fetch API "
             "error handling components security"
         ),
-
-        # PostgreSQL
         (
             "PostgreSQL database transactions connections queries "
             "pgvector embeddings persistence"
         ),
-
-        # LangGraph / AI
         (
             "LangGraph workflow retrieval embeddings LLM generation "
             "prompts orchestration"
@@ -517,7 +518,6 @@ def get_diverse_review_sources():
     candidates = {}
 
     for query in review_queries:
-
         try:
             query_vector = embed_texts(
                 [query],
@@ -526,11 +526,11 @@ def get_diverse_review_sources():
 
             results = search_chunks(
                 query_vector,
+                repository=repository,
                 limit=8,
             )
 
             for result in results:
-
                 key = (
                     f'{result["path"]}:'
                     f'{result["start_line"]}:'
@@ -552,39 +552,33 @@ def get_diverse_review_sources():
                 query,
             )
 
-    # Sort strongest candidates first
     sorted_candidates = sorted(
         candidates.values(),
         key=lambda item: float(item["score"]),
         reverse=True,
     )
 
-    # Maximum two chunks from one file
-    MAX_CHUNKS_PER_FILE = 2
-    MAX_REVIEW_CHUNKS = 20
+    max_chunks_per_file = 2
+    max_review_chunks = 20
 
     selected = []
     per_file_count = {}
 
-    # First pass: diversity
+    # First pass: prioritize file diversity.
     for item in sorted_candidates:
-
         path = item["path"]
 
-        count = per_file_count.get(path, 0)
-
-        if count >= MAX_CHUNKS_PER_FILE:
+        if per_file_count.get(path, 0) >= max_chunks_per_file:
             continue
 
         selected.append(item)
-        per_file_count[path] = count + 1
+        per_file_count[path] = per_file_count.get(path, 0) + 1
 
-        if len(selected) >= MAX_REVIEW_CHUNKS:
+        if len(selected) >= max_review_chunks:
             break
 
-    # Second pass: fill remaining slots
-    if len(selected) < MAX_REVIEW_CHUNKS:
-
+    # Second pass: fill remaining slots.
+    if len(selected) < max_review_chunks:
         selected_keys = {
             (
                 item["path"],
@@ -595,7 +589,6 @@ def get_diverse_review_sources():
         }
 
         for item in sorted_candidates:
-
             key = (
                 item["path"],
                 item["start_line"],
@@ -607,47 +600,35 @@ def get_diverse_review_sources():
 
             selected.append(item)
 
-            if len(selected) >= MAX_REVIEW_CHUNKS:
+            if len(selected) >= max_review_chunks:
                 break
 
     logger.info(
-        "Diverse review retrieval: %s unique candidates, "
-        "%s selected chunks across %s files",
+        "Diverse review retrieval: %s candidates, %s selected chunks "
+        "across %s files",
         len(sorted_candidates),
         len(selected),
-        len(set(item["path"] for item in selected)),
+        len({item["path"] for item in selected}),
     )
 
     return format_review_sources(selected)
 
 
-# ---------------------------------------------------------
-# Repository Code Review
-# ---------------------------------------------------------
+# =========================================================
+# Repository code review
+# =========================================================
 
-@app.post(
-    "/api/review",
-    response_model=ReviewResponse,
-)
-def review():
-
+@app.post("/api/review", response_model=ReviewResponse)
+def review(
+    repository: str = Query(DEFAULT_REPOSITORY_ID, min_length=1, max_length=512),
+):
     try:
+        logger.info("Starting full repository code review for %s", repository)
 
-        logger.info(
-            "Starting full repository code review"
-        )
-
-        # -------------------------------------------------
-        # IMPORTANT:
-        # Full repository coverage.
-        # Previously this used get_diverse_review_sources(),
-        # which selected only 20 semantic chunks.
-        # -------------------------------------------------
-
-        sources = get_full_repository_review_sources()
+        # Review all indexed chunks, not only the semantic top 20.
+        sources = get_full_repository_review_sources(repository)
 
         if not sources:
-
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -663,27 +644,16 @@ def review():
 
         result = review_repository(sources)
 
-        # -------------------------------------------------
-        # Convert sources to Pydantic Source models
-        # -------------------------------------------------
-
-        formatted_sources = []
-
-        for source in sources:
-
-            formatted_sources.append(
-                Source(
-                    file=source["file"],
-                    path=source["path"],
-                    lines=source["lines"],
-                    score=str(source["score"]),
-                    content=source["content"],
-                )
+        formatted_sources = [
+            Source(
+                file=source["file"],
+                path=source["path"],
+                lines=source["lines"],
+                score=str(source["score"]),
+                content=source["content"],
             )
-
-        # -------------------------------------------------
-        # Return structured review
-        # -------------------------------------------------
+            for source in sources
+        ]
 
         return ReviewResponse(
             findings=result.get("findings", []),
@@ -710,10 +680,7 @@ def review():
         raise
 
     except Exception as exc:
-
-        logger.exception(
-            "Repository review failed"
-        )
+        logger.exception("Repository review failed")
 
         raise HTTPException(
             status_code=500,

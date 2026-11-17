@@ -1,6 +1,9 @@
 from pydantic_settings import BaseSettings
 
 
+DEFAULT_REPOSITORY_ID = "codebase-ai"
+
+
 class Settings(BaseSettings):
     gemini_api_key: str = ""
     llm_provider: str = "gemini"
